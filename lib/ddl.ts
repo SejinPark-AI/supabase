@@ -732,6 +732,11 @@ export function buildPreviewSql(plan: MigrationPlan, all: TableDef[], options: M
 
 const TEXT_CAST_TYPES = new Set(["bigint", "numeric", "money"]);
 
+/** PostgREST select/order 파라미터용 컬럼 참조: 단순 식별자는 그대로, 그 밖에는 큰따옴표로 감쌉니다. */
+export function pgrstColumnRef(name: string): string {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? name : `"${name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 /**
  * PostgREST select 파라미터. JS number 정밀도 손실을 막기 위해 bigint/numeric은 ::text로 캐스트합니다.
  * (json_populate_recordset이 문자열을 원래 타입으로 다시 변환)
@@ -744,8 +749,7 @@ export function buildSelectList(table: TableDef): string {
   if (!needsCast) return "*";
   return table.columns
     .map((c) => {
-      const simple = /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.name);
-      const ref = simple ? c.name : `"${c.name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+      const ref = pgrstColumnRef(c.name);
       const b = normalizeBaseType(c.format);
       return b && TEXT_CAST_TYPES.has(b.replace(/\(.*\)$/, "")) ? `${ref}::text` : ref;
     })

@@ -10,7 +10,19 @@ import {
   type MigrationOptions,
   type TableDef,
 } from "@/lib/ddl";
-import { countRows, introspect, normalizeUrl, type SourceConfig } from "@/lib/source";
+import {
+  SOURCE_MODE_LABEL,
+  createAnonReader,
+  createServerReader,
+  fetchSourceStatus,
+  forgetServiceKey,
+  normalizeUrl,
+  saveServiceKey,
+  type SourceMode,
+  type SourceReader,
+  type SourceStatus,
+} from "@/lib/source";
+import { projectRefFromUrl, sameSourceUrl } from "@/lib/source-core";
 import { runMigration, targetQuery, type LogLevel, type RunSummary, type TableProgress } from "@/lib/runner";
 import { Alert, Badge, Button, Card, ProgressBar, cx, inputClass } from "./ui";
 
@@ -28,17 +40,12 @@ interface LogEntry {
   message: string;
 }
 
-const STEPS = ["원본(Source)", "대상(Target)", "테이블 선택", "실행"] as const;
-
-function sourceRef(url: string): string | null {
-  try {
-    const host = new URL(url).hostname;
-    const m = host.match(/^([a-z0-9]+)\.supabase\.(co|in)$/);
-    return m ? m[1] : null;
-  } catch {
-    return null;
-  }
-}
+/**
+ * 단계 순서: 계정 로그인을 먼저 둡니다. 대상 쓰기에 어차피 필요하고,
+ * service_role(env) 모드는 로그인한 계정이 원본 프로젝트에 접근할 수 있는지 확인한 뒤에만 쓸 수 있기 때문입니다.
+ * (anon 모드는 로그인 없이도 원본 단계를 진행할 수 있습니다.)
+ */
+const STEPS = ["계정 로그인", "원본(Source)", "대상(Target)", "테이블 선택", "실행"] as const;
 
 async function mapLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<void>) {
   const queue = [...items];
@@ -53,11 +60,15 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
   const [step, setStep] = useState(1);
 
   // ---- Source
+  const [srcMode, setSrcMode] = useState<SourceMode>("anon");
   const [srcUrl, setSrcUrl] = useState(defaultUrl);
   const [srcKey, setSrcKey] = useState(defaultAnonKey);
-  const [source, setSource] = useState<SourceConfig | null>(null);
+  const [svcKey, setSvcKey] = useState("");
+  const [srcStatus, setSrcStatus] = useState<SourceStatus | null>(null);
+  const [source, setSource] = useState<SourceReader | null>(null);
   const [srcLoading, setSrcLoading] = useState(false);
   const [srcError, setSrcError] = useState<string | null>(null);
+  const [srcNotice, setSrcNotice] = useState<string | null>(null);
   const [tables, setTables] = useState<TableDef[]>([]);
   const [parseWarnings, setParseWarnings] = useState<string[]>([]);
   const [rowCounts, setRowCounts] = useState<Record<string, number | null>>({});
@@ -91,49 +102,68 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
   const [stopRequested, setStopRequested] = useState(false);
   const logId = useRef(0);
   const logBox = useRef<HTMLDivElement>(null);
+  const connectSeq = useRef(0);
 
   // ======================================================================
   // Source
   // ======================================================================
-  const connectSource = useCallback(async (url: string, key: string) => {
-    const cfg = { url: normalizeUrl(url), anonKey: key.trim() };
-    if (!cfg.url || !cfg.anonKey) {
-      setSrcError("URL과 anon 키를 입력하세요.");
-      return;
-    }
-    setSrcLoading(true);
-    setSrcError(null);
+  const resetSource = useCallback(() => {
+    connectSeq.current++;
     setSource(null);
     setTables([]);
     setRowCounts({});
     setCountErrors({});
+    setParseWarnings([]);
+  }, []);
+
+  /** 리더로 스키마/행 수를 불러옵니다 (anon: 브라우저 직접, service_role: 서버 경유). */
+  const connectReader = useCallback(
+    async (reader: SourceReader) => {
+      resetSource();
+      const seq = connectSeq.current;
+      setSrcLoading(true);
+      setSrcError(null);
+      try {
+        const { tables: parsed, warnings } = await reader.introspect();
+        if (seq !== connectSeq.current) return;
+        setTables(parsed);
+        setParseWarnings(warnings);
+        setSource(reader);
+        setSelected(new Set(parsed.filter((t) => !t.likelyView).map((t) => t.name)));
+        // 행 수 조회 (동시 4개)
+        await mapLimit(parsed, 4, async (t) => {
+          if (seq !== connectSeq.current) return;
+          try {
+            const n = await reader.count(t.name);
+            if (seq === connectSeq.current) setRowCounts((prev) => ({ ...prev, [t.name]: n }));
+          } catch (e) {
+            if (seq !== connectSeq.current) return;
+            setRowCounts((prev) => ({ ...prev, [t.name]: null }));
+            setCountErrors((prev) => ({ ...prev, [t.name]: (e as Error).message }));
+          }
+        });
+      } catch (e) {
+        if (seq === connectSeq.current) setSrcError((e as Error).message);
+      } finally {
+        if (seq === connectSeq.current) setSrcLoading(false);
+      }
+    },
+    [resetSource],
+  );
+
+  const loadSourceStatus = useCallback(async () => {
     try {
-      const { tables: parsed, warnings } = await introspect(cfg);
-      setTables(parsed);
-      setParseWarnings(warnings);
-      setSource(cfg);
-      setSelected(new Set(parsed.filter((t) => !t.likelyView).map((t) => t.name)));
-      // 행 수 조회 (동시 4개)
-      await mapLimit(parsed, 4, async (t) => {
-        try {
-          const n = await countRows(cfg, t.name);
-          setRowCounts((prev) => ({ ...prev, [t.name]: n }));
-        } catch (e) {
-          setRowCounts((prev) => ({ ...prev, [t.name]: null }));
-          setCountErrors((prev) => ({ ...prev, [t.name]: (e as Error).message }));
-        }
-      });
+      setSrcStatus(await fetchSourceStatus());
     } catch (e) {
-      setSrcError((e as Error).message);
-    } finally {
-      setSrcLoading(false);
+      setSrcStatus(null);
+      setSrcError(`원본 모드 상태를 불러오지 못했습니다: ${(e as Error).message}`);
     }
   }, []);
 
   // ======================================================================
   // Target
   // ======================================================================
-  const loadProjects = useCallback(async () => {
+  const loadProjects = useCallback(async (): Promise<boolean> => {
     setTargetError(null);
     try {
       const res = await fetch("/api/target/projects", { cache: "no-store" });
@@ -142,30 +172,40 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
         setLoggedIn(false);
         setProjects([]);
         if (body.error && body.error !== "로그인이 필요합니다.") setTargetError(body.error);
-        return;
+        return false;
       }
       if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
       setLoggedIn(true);
       setProjects(body.projects ?? []);
+      return true;
     } catch (e) {
       setTargetError((e as Error).message);
+      return false;
     }
   }, []);
 
   useEffect(() => {
     let cancelled = false;
-    // 초기 로드: env 값으로 원본 연결, 세션 쿠키 확인
+    // 초기 로드: 세션 쿠키/원본 모드 상태 확인, env anon 값으로 원본 연결
     const init = async () => {
       await Promise.resolve();
       if (cancelled) return;
-      if (defaultUrl && defaultAnonKey) void connectSource(defaultUrl, defaultAnonKey);
-      void loadProjects();
+      if (defaultUrl && defaultAnonKey) {
+        try {
+          void connectReader(createAnonReader(defaultUrl, defaultAnonKey));
+        } catch (e) {
+          setSrcError((e as Error).message);
+        }
+      }
+      void loadSourceStatus();
+      const ok = await loadProjects();
+      if (!cancelled && ok) setStep((s) => (s === 1 ? 2 : s));
     };
     void init();
     return () => {
       cancelled = true;
     };
-  }, [defaultUrl, defaultAnonKey, connectSource, loadProjects]);
+  }, [defaultUrl, defaultAnonKey, connectReader, loadProjects, loadSourceStatus]);
 
   const login = async () => {
     setLoginBusy(true);
@@ -180,6 +220,7 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
       if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
       setToken("");
       await loadProjects();
+      await loadSourceStatus();
     } catch (e) {
       setTargetError((e as Error).message);
     } finally {
@@ -193,6 +234,9 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
     setProjects([]);
     setRef("");
     setTestResult(null);
+    // env service_role 모드는 로그인이 필요하므로 연결을 해제
+    if (source?.mode === "service-env") resetSource();
+    await loadSourceStatus();
   };
 
   const testConnection = async () => {
@@ -207,6 +251,69 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
     }
   };
 
+  // ---- 원본 모드별 사용 가능 여부
+  const envInfo = srcStatus?.env;
+  const envUrlMatches = !!envInfo?.url && sameSourceUrl(srcUrl, envInfo.url);
+  const envBlocker: string | null = !srcStatus
+    ? "서버 상태 확인 중…"
+    : !envInfo?.available
+      ? (envInfo?.reason ?? "사용할 수 없습니다.")
+      : !envUrlMatches
+        ? `원본 URL을 바꿔서 사용할 수 없습니다. env 키는 환경 변수 URL(${envInfo.url})에만 사용됩니다.`
+        : srcStatus.envAccess.state === "login-required" || loggedIn !== true
+          ? "먼저 1단계에서 Supabase 계정으로 로그인하세요 (원본 프로젝트 접근 권한 확인)."
+          : srcStatus.envAccess.state === "denied" || srcStatus.envAccess.state === "error"
+            ? (srcStatus.envAccess.message ?? "원본 프로젝트 접근 권한을 확인할 수 없습니다.")
+            : null;
+  const storedKey = srcStatus?.cookie;
+  const storedKeyMatches = !!storedKey?.present && sameSourceUrl(srcUrl, storedKey.url);
+
+  const connectSource = async () => {
+    setSrcError(null);
+    setSrcNotice(null);
+    const url = normalizeUrl(srcUrl);
+    try {
+      if (srcMode === "anon") {
+        if (!url || !srcKey.trim()) {
+          setSrcError("URL과 anon 키를 입력하세요.");
+          return;
+        }
+        await connectReader(createAnonReader(url, srcKey));
+      } else if (srcMode === "service-env") {
+        if (envBlocker) {
+          setSrcError(envBlocker);
+          return;
+        }
+        await connectReader(createServerReader("service-env", url));
+      } else {
+        if (svcKey.trim()) {
+          setSrcLoading(true);
+          try {
+            const saved = await saveServiceKey(url, svcKey.trim());
+            setSvcKey("");
+            setSrcNotice(`키를 서버 쿠키에 저장했습니다 (${saved.url} 전용, 키 종류: ${saved.keyKind}).`);
+          } finally {
+            setSrcLoading(false);
+          }
+          await loadSourceStatus();
+        } else if (!storedKeyMatches) {
+          setSrcError(storedKey?.present ? `저장된 키는 ${storedKey.url} 에 묶여 있습니다. 이 URL용 service_role 키를 입력하세요.` : "service_role 키를 입력하세요.");
+          return;
+        }
+        await connectReader(createServerReader("service-cookie", url));
+      }
+    } catch (e) {
+      setSrcError((e as Error).message);
+    }
+  };
+
+  const forgetKey = async () => {
+    await forgetServiceKey().catch(() => undefined);
+    if (source?.mode === "service-cookie") resetSource();
+    setSrcNotice("저장된 service_role 키를 삭제했습니다.");
+    await loadSourceStatus();
+  };
+
   // ======================================================================
   // Plan
   // ======================================================================
@@ -217,16 +324,16 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
     [showPreview, plan, tables, options, rowCounts],
   );
 
-  const srcRef = source ? sourceRef(source.url) : null;
+  const srcRef = source ? projectRefFromUrl(source.url) : null;
   const sameProject = !!srcRef && srcRef === ref;
   const needsDropConfirm = options.mode === "schema+data" && options.ifExists === "drop";
   const canRun =
     !!source && loggedIn === true && !!ref && selectedList.length > 0 && !running && (!needsDropConfirm || dropConfirmed);
 
   const stepEnabled = (n: number) => {
-    if (n === 1) return true;
-    if (n === 2) return !!source;
-    if (n === 3) return !!source && loggedIn === true && !!ref;
+    if (n === 1 || n === 2) return true; // anon 모드는 로그인 없이 원본 단계 진행 가능
+    if (n === 3) return !!source && loggedIn === true;
+    if (n === 4) return !!source && loggedIn === true && !!ref;
     return !!source && loggedIn === true && !!ref && selectedList.length > 0;
   };
 
@@ -312,6 +419,22 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
 
       <Limitations />
 
+      {source && (
+        <div
+          className={cx(
+            "flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-sm",
+            source.mode === "anon"
+              ? "border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900"
+              : "border-red-300 bg-red-50 text-red-900 dark:border-red-800 dark:bg-red-950/40 dark:text-red-200",
+          )}
+        >
+          <span className="font-medium">원본 읽기:</span>
+          <SourceModeBadge mode={source.mode} />
+          <code className="text-xs">{source.url}</code>
+          {source.mode !== "anon" && <span className="text-xs">RLS 우회 — 모든 행을 서버에서 읽습니다</span>}
+        </div>
+      )}
+
       {/* Stepper */}
       <nav className="flex flex-wrap gap-2">
         {STEPS.map((label, i) => {
@@ -337,90 +460,24 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
         })}
       </nav>
 
-      {/* ---------------- Step 1: Source ---------------- */}
+      {/* ---------------- Step 1: Login ---------------- */}
       {step === 1 && (
         <Card
-          title="1. 원본(Source) 프로젝트"
-          right={
-            source ? (
-              <Badge tone="green">연결됨 · 테이블 {tables.length}개</Badge>
-            ) : srcLoading ? (
-              <Badge tone="blue">연결 중…</Badge>
-            ) : (
-              <Badge>미연결</Badge>
-            )
-          }
-        >
-          <div className="space-y-3">
-            <p className="text-sm text-slate-600 dark:text-slate-400">
-              기본값은 환경 변수 <code>NEXT_PUBLIC_SUPABASE_URL</code> / <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code>
-              에서 가져옵니다. 필요하면 다른 값으로 바꿔 연결할 수 있습니다.
-            </p>
-            <label className="block text-sm">
-              <span className="mb-1 block font-medium">Project URL</span>
-              <input className={inputClass} value={srcUrl} onChange={(e) => setSrcUrl(e.target.value)} placeholder="https://xxxx.supabase.co" />
-            </label>
-            <label className="block text-sm">
-              <span className="mb-1 block font-medium">anon 키</span>
-              <input className={inputClass} type="password" value={srcKey} onChange={(e) => setSrcKey(e.target.value)} placeholder="eyJ..." autoComplete="off" />
-            </label>
-            <div className="flex flex-wrap gap-2">
-              <Button onClick={() => connectSource(srcUrl, srcKey)} disabled={srcLoading}>
-                {srcLoading ? "불러오는 중…" : "연결 및 스키마 불러오기"}
-              </Button>
-              {(srcUrl !== defaultUrl || srcKey !== defaultAnonKey) && (
-                <Button
-                  variant="ghost"
-                  onClick={() => {
-                    setSrcUrl(defaultUrl);
-                    setSrcKey(defaultAnonKey);
-                  }}
-                >
-                  환경 변수 값으로 되돌리기
-                </Button>
-              )}
-            </div>
-            {!defaultUrl && !source && <Alert tone="amber">환경 변수가 설정되지 않았습니다. URL과 anon 키를 직접 입력하세요.</Alert>}
-            {srcError && <Alert>{srcError}</Alert>}
-            {source && (
-              <Alert tone="green">
-                {source.url} 에 연결되었습니다. 테이블/뷰 {tables.length}개를 찾았습니다
-                {tables.some((t) => t.likelyView) && ` (뷰로 추정: ${tables.filter((t) => t.likelyView).length}개)`}.
-              </Alert>
-            )}
-            {parseWarnings.length > 0 && (
-              <Alert tone="amber">
-                {parseWarnings.map((w) => (
-                  <div key={w}>{w}</div>
-                ))}
-              </Alert>
-            )}
-            <div className="flex justify-end">
-              <Button onClick={() => setStep(2)} disabled={!source}>
-                다음 →
-              </Button>
-            </div>
-          </div>
-        </Card>
-      )}
-
-      {/* ---------------- Step 2: Target ---------------- */}
-      {step === 2 && (
-        <Card
-          title="2. 대상(Target) 프로젝트"
+          title="1. Supabase 계정 로그인"
           right={loggedIn ? <Badge tone="green">로그인됨</Badge> : loggedIn === null ? <Badge tone="blue">확인 중…</Badge> : <Badge>로그아웃</Badge>}
         >
           <div className="space-y-3">
+            <p className="text-sm text-slate-600 dark:text-slate-400">
+              Supabase Personal Access Token으로 로그인합니다. 대상 프로젝트에 쓰기 위해 필요하며, 원본을{" "}
+              <b>service_role (env)</b> 모드로 읽을 때는 이 계정이 원본 프로젝트에 접근할 수 있는지 확인하는 데에도 쓰입니다.{" "}
+              <a className="text-emerald-700 underline dark:text-emerald-400" href="https://supabase.com/dashboard/account/tokens" target="_blank" rel="noreferrer">
+                토큰 발급 페이지 ↗
+              </a>
+              <br />
+              토큰은 서버의 httpOnly 쿠키에만 저장되며 브라우저 스크립트에서 읽을 수 없습니다.
+            </p>
             {loggedIn === false && (
               <>
-                <p className="text-sm text-slate-600 dark:text-slate-400">
-                  Supabase Personal Access Token으로 로그인합니다.{" "}
-                  <a className="text-emerald-700 underline dark:text-emerald-400" href="https://supabase.com/dashboard/account/tokens" target="_blank" rel="noreferrer">
-                    토큰 발급 페이지 ↗
-                  </a>
-                  <br />
-                  토큰은 서버의 httpOnly 쿠키에만 저장되며 브라우저 스크립트에서 읽을 수 없습니다.
-                </p>
                 <form
                   className="flex flex-wrap gap-2"
                   onSubmit={(e) => {
@@ -443,6 +500,191 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
                 {token && !token.trim().startsWith("sbp_") && <Alert tone="amber">일반적으로 Personal Access Token은 sbp_ 로 시작합니다.</Alert>}
               </>
             )}
+            {loggedIn && (
+              <div className="flex flex-wrap items-center gap-2 text-sm">
+                <span>접근 가능한 프로젝트 {projects.length}개</span>
+                <Button variant="ghost" onClick={() => void logout()}>
+                  로그아웃
+                </Button>
+              </div>
+            )}
+            {targetError && <Alert>{targetError}</Alert>}
+            <div className="flex justify-end">
+              <Button onClick={() => setStep(2)}>{loggedIn ? "다음 →" : "로그인 없이 원본 설정 (anon 모드만) →"}</Button>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {/* ---------------- Step 2: Source ---------------- */}
+      {step === 2 && (
+        <Card
+          title="2. 원본(Source) 프로젝트"
+          right={
+            source ? (
+              <Badge tone="green">연결됨 · 테이블 {tables.length}개</Badge>
+            ) : srcLoading ? (
+              <Badge tone="blue">연결 중…</Badge>
+            ) : (
+              <Badge>미연결</Badge>
+            )
+          }
+        >
+          <div className="space-y-3">
+            <fieldset className="space-y-1.5 text-sm">
+              <legend className="mb-1 font-medium">읽기 방식</legend>
+              <ModeOption
+                checked={srcMode === "anon"}
+                onChange={() => setSrcMode("anon")}
+                label={SOURCE_MODE_LABEL.anon}
+                hint="브라우저가 anon 키로 직접 읽습니다. RLS 정책이 허용하는 행만 읽힙니다."
+              />
+              <ModeOption
+                checked={srcMode === "service-env"}
+                onChange={() => setSrcMode("service-env")}
+                label={SOURCE_MODE_LABEL["service-env"]}
+                hint={
+                  envBlocker && srcMode !== "service-env"
+                    ? `사용 불가: ${envBlocker}`
+                    : "서버 환경 변수 SUPABASE_SERVICE_ROLE_KEY로 서버에서 읽습니다. 키는 브라우저로 전달되지 않습니다."
+                }
+                disabled={!envInfo?.available}
+              />
+              <ModeOption
+                checked={srcMode === "service-cookie"}
+                onChange={() => setSrcMode("service-cookie")}
+                label={SOURCE_MODE_LABEL["service-cookie"]}
+                hint="키를 한 번 서버로 보내 httpOnly 쿠키(8시간)에 원본 URL과 함께 저장하고, 이후 서버에서 읽습니다."
+              />
+            </fieldset>
+
+            {srcMode !== "anon" && <ServiceRoleWarning />}
+
+            <label className="block text-sm">
+              <span className="mb-1 block font-medium">Project URL</span>
+              <input className={inputClass} value={srcUrl} onChange={(e) => setSrcUrl(e.target.value)} placeholder="https://xxxx.supabase.co" />
+            </label>
+
+            {srcMode === "anon" && (
+              <>
+                <p className="text-xs text-slate-500">
+                  기본값은 환경 변수 <code>NEXT_PUBLIC_SUPABASE_URL</code> / <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code> 입니다.
+                </p>
+                <label className="block text-sm">
+                  <span className="mb-1 block font-medium">anon 키</span>
+                  <input className={inputClass} type="password" value={srcKey} onChange={(e) => setSrcKey(e.target.value)} placeholder="eyJ..." autoComplete="off" />
+                </label>
+              </>
+            )}
+
+            {srcMode === "service-env" && (
+              <>
+                {envBlocker ? (
+                  <Alert tone="amber">
+                    <div>{envBlocker}</div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {envInfo?.available && !envUrlMatches && (
+                        <Button variant="secondary" onClick={() => setSrcUrl(envInfo.url!)}>
+                          환경 변수 URL 사용
+                        </Button>
+                      )}
+                      {envInfo?.available && envUrlMatches && loggedIn !== true && (
+                        <Button variant="secondary" onClick={() => setStep(1)}>
+                          ← 1단계에서 로그인
+                        </Button>
+                      )}
+                    </div>
+                  </Alert>
+                ) : (
+                  <Alert tone="blue">
+                    env 키 사용 가능: <code>{envInfo?.url}</code>
+                    {envInfo?.gate === "project-access" ? ` · 로그인한 계정이 프로젝트 ${envInfo.ref}에 접근 가능함을 확인했습니다.` : " · ALLOW_UNVERIFIED_SERVICE_ROLE=true (접근 확인 없음)"}
+                  </Alert>
+                )}
+                {envInfo?.keyKind && envInfo.keyKind !== "service_role" && envInfo.keyKind !== "secret" && (
+                  <Alert tone="amber">환경 변수 키가 service_role 키가 아닌 것 같습니다 (종류: {envInfo.keyKind}). RLS가 적용될 수 있습니다.</Alert>
+                )}
+              </>
+            )}
+
+            {srcMode === "service-cookie" && (
+              <>
+                <label className="block text-sm">
+                  <span className="mb-1 block font-medium">service_role 키</span>
+                  <input
+                    className={inputClass}
+                    type="password"
+                    value={svcKey}
+                    onChange={(e) => setSvcKey(e.target.value)}
+                    placeholder={storedKeyMatches ? "저장된 키 사용 (새 키를 입력하면 교체)" : "eyJ... 또는 sb_secret_..."}
+                    autoComplete="off"
+                  />
+                </label>
+                {storedKey?.present && (
+                  <div className="flex flex-wrap items-center gap-2 text-sm">
+                    <span>
+                      저장된 키: <code>{storedKey.url}</code> 전용 {storedKey.keyKind && `(${storedKey.keyKind})`}
+                    </span>
+                    {!storedKeyMatches && <Badge tone="amber">현재 URL과 다름 — 사용 불가</Badge>}
+                    <Button variant="ghost" onClick={() => void forgetKey()}>
+                      저장된 키 삭제
+                    </Button>
+                  </div>
+                )}
+              </>
+            )}
+
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={() => void connectSource()} disabled={srcLoading || (srcMode === "service-env" && !!envBlocker)}>
+                {srcLoading ? "불러오는 중…" : "연결 및 스키마 불러오기"}
+              </Button>
+              {(srcUrl !== defaultUrl || srcKey !== defaultAnonKey) && (
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    setSrcUrl(defaultUrl);
+                    setSrcKey(defaultAnonKey);
+                  }}
+                >
+                  환경 변수 값으로 되돌리기
+                </Button>
+              )}
+            </div>
+            {!defaultUrl && !source && srcMode === "anon" && <Alert tone="amber">환경 변수가 설정되지 않았습니다. URL과 anon 키를 직접 입력하세요.</Alert>}
+            {srcNotice && <Alert tone="blue">{srcNotice}</Alert>}
+            {srcError && <Alert>{srcError}</Alert>}
+            {source && (
+              <Alert tone="green">
+                {source.url} 에 <b>{SOURCE_MODE_LABEL[source.mode]}</b> 방식으로 연결되었습니다. 테이블/뷰 {tables.length}개를 찾았습니다
+                {tables.some((t) => t.likelyView) && ` (뷰로 추정: ${tables.filter((t) => t.likelyView).length}개)`}.
+                {source.mode !== srcMode && " (선택한 읽기 방식과 다릅니다 — 바꾸려면 다시 연결하세요.)"}
+              </Alert>
+            )}
+            {parseWarnings.length > 0 && (
+              <Alert tone="amber">
+                {parseWarnings.map((w) => (
+                  <div key={w}>{w}</div>
+                ))}
+              </Alert>
+            )}
+            <div className="flex justify-between">
+              <Button variant="secondary" onClick={() => setStep(1)}>
+                ← 이전
+              </Button>
+              <Button onClick={() => setStep(3)} disabled={!stepEnabled(3)} title={loggedIn !== true ? "1단계에서 로그인하세요" : undefined}>
+                다음 →
+              </Button>
+            </div>
+            {source && loggedIn !== true && <p className="text-right text-xs text-slate-500">다음 단계(대상 선택)로 가려면 1단계에서 로그인하세요.</p>}
+          </div>
+        </Card>
+      )}
+
+      {/* ---------------- Step 3: Target ---------------- */}
+      {step === 3 && (
+        <Card title="3. 대상(Target) 프로젝트" right={loggedIn ? <Badge tone="green">로그인됨</Badge> : <Badge>로그아웃</Badge>}>
+          <div className="space-y-3">
+            {loggedIn !== true && <Alert tone="amber">1단계에서 Supabase 계정으로 로그인하세요.</Alert>}
             {loggedIn && (
               <>
                 <div className="flex flex-wrap items-end gap-2">
@@ -470,9 +712,6 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
                   <Button variant="secondary" onClick={() => void testConnection()} disabled={!ref}>
                     연결 테스트
                   </Button>
-                  <Button variant="ghost" onClick={() => void logout()}>
-                    로그아웃
-                  </Button>
                 </div>
                 {projects.length === 0 && <Alert tone="amber">이 계정에서 접근 가능한 프로젝트가 없습니다.</Alert>}
                 {ref && projects.find((p) => p.ref === ref)?.status && projects.find((p) => p.ref === ref)!.status !== "ACTIVE_HEALTHY" && (
@@ -484,10 +723,10 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
             )}
             {targetError && <Alert>{targetError}</Alert>}
             <div className="flex justify-between">
-              <Button variant="secondary" onClick={() => setStep(1)}>
+              <Button variant="secondary" onClick={() => setStep(2)}>
                 ← 이전
               </Button>
-              <Button onClick={() => setStep(3)} disabled={!stepEnabled(3)}>
+              <Button onClick={() => setStep(4)} disabled={!stepEnabled(4)}>
                 다음 →
               </Button>
             </div>
@@ -495,11 +734,11 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
         </Card>
       )}
 
-      {/* ---------------- Step 3: Tables ---------------- */}
-      {step === 3 && (
+      {/* ---------------- Step 4: Tables ---------------- */}
+      {step === 4 && (
         <>
           <Card
-            title="3. 테이블 선택"
+            title="4. 테이블 선택"
             right={
               <div className="flex flex-wrap items-center gap-2 text-sm">
                 <span className="text-slate-500">
@@ -626,10 +865,10 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
               </details>
             )}
             <div className="mt-4 flex justify-between">
-              <Button variant="secondary" onClick={() => setStep(2)}>
+              <Button variant="secondary" onClick={() => setStep(3)}>
                 ← 이전
               </Button>
-              <Button onClick={() => setStep(4)} disabled={!stepEnabled(4)}>
+              <Button onClick={() => setStep(5)} disabled={!stepEnabled(5)}>
                 다음 →
               </Button>
             </div>
@@ -637,11 +876,11 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
         </>
       )}
 
-      {/* ---------------- Step 4: Run ---------------- */}
-      {step === 4 && (
+      {/* ---------------- Step 5: Run ---------------- */}
+      {step === 5 && (
         <>
           <Card
-            title="4. 실행"
+            title="5. 실행"
             right={
               <div className="flex gap-2">
                 <Button variant="secondary" onClick={() => setShowPreview((v) => !v)}>
@@ -656,7 +895,7 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
             <div className="space-y-3 text-sm">
               <div className="grid gap-1 sm:grid-cols-2">
                 <div>
-                  원본: <code>{source?.url}</code>
+                  원본: <code>{source?.url}</code> {source && <SourceModeBadge mode={source.mode} />}
                 </div>
                 <div>
                   대상: <code>{projects.find((p) => p.ref === ref)?.name ?? ref}</code> ({ref})
@@ -670,7 +909,7 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
                 </div>
               </div>
               {sameProject && <Alert>대상 프로젝트가 원본과 같습니다. 실행하지 마세요.</Alert>}
-              {needsDropConfirm && !dropConfirmed && <Alert>3단계에서 삭제 확인 체크박스를 선택해야 실행할 수 있습니다.</Alert>}
+              {needsDropConfirm && !dropConfirmed && <Alert>4단계에서 삭제 확인 체크박스를 선택해야 실행할 수 있습니다.</Alert>}
               {showPreview && (
                 <pre className="max-h-96 overflow-auto rounded-md bg-slate-900 p-3 font-mono text-xs leading-relaxed text-slate-100">{previewSql}</pre>
               )}
@@ -684,7 +923,7 @@ export default function Migrator({ defaultUrl, defaultAnonKey }: { defaultUrl: s
                   </Button>
                 )}
                 {!running && (
-                  <Button variant="secondary" onClick={() => setStep(3)}>
+                  <Button variant="secondary" onClick={() => setStep(4)}>
                     ← 이전
                   </Button>
                 )}
@@ -786,13 +1025,64 @@ function Limitations() {
     <details open className="rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
       <summary className="cursor-pointer font-semibold">⚠ 제한사항</summary>
       <ul className="mt-2 list-disc space-y-0.5 pl-5">
-        <li>anon 키로는 RLS 정책이 허용하는 행만 읽을 수 있습니다. 정책에 막힌 행은 복사되지 않습니다.</li>
+        <li>
+          <b>anon 키 모드</b>에서는 RLS 정책이 허용하는 행만 읽을 수 있습니다. 정책에 막힌 행은 복사되지 않습니다. (service_role 모드는 RLS를
+          우회해 모든 행을 읽습니다.)
+        </li>
         <li>PostgREST로 노출된 <code>public</code> 스키마의 테이블만 대상입니다.</li>
         <li>함수, 트리거, RLS 정책, 뷰 정의, 인덱스(PK 제외), CHECK/UNIQUE 제약, FK의 ON DELETE 동작, Storage, auth.users 등은 복사되지 않습니다.</li>
         <li>컬럼 타입·기본값은 OpenAPI 정보에서 추정하므로 원본과 다를 수 있습니다 (SQL 미리보기로 확인하세요).</li>
         <li>복사 중 원본 데이터가 바뀌면 결과가 일관되지 않을 수 있습니다.</li>
       </ul>
     </details>
+  );
+}
+
+function SourceModeBadge({ mode }: { mode: SourceMode }) {
+  return <Badge tone={mode === "anon" ? "slate" : "red"}>{SOURCE_MODE_LABEL[mode]}</Badge>;
+}
+
+function ServiceRoleWarning() {
+  return (
+    <Alert>
+      <div className="font-semibold">⚠ service_role 키 주의</div>
+      <ul className="mt-1 list-disc space-y-0.5 pl-5">
+        <li>
+          <b>RLS를 우회</b>합니다. 정책과 관계없이 <b>모든 행</b>(다른 사용자의 개인 데이터 포함)이 읽힙니다.
+        </li>
+        <li>
+          키가 유출되면 <b>DB 전체에 대한 읽기/쓰기 권한</b>이 넘어갑니다. 키는 서버에만 보관되며 브라우저로 전달되지 않습니다.
+        </li>
+        <li>
+          이 앱을 <b>공개 서버에 배포하지 마세요.</b> 로컬/신뢰할 수 있는 환경에서만 사용하세요.
+        </li>
+        <li>env 모드는 로그인한 Supabase 계정이 원본 프로젝트에 접근할 수 있을 때만 동작합니다. 직접 입력한 키는 입력한 URL에만 사용됩니다.</li>
+      </ul>
+    </Alert>
+  );
+}
+
+function ModeOption({
+  checked,
+  onChange,
+  label,
+  hint,
+  disabled,
+}: {
+  checked: boolean;
+  onChange: () => void;
+  label: string;
+  hint: string;
+  disabled?: boolean;
+}) {
+  return (
+    <label className={cx("flex items-start gap-2", disabled && "opacity-50")}>
+      <input type="radio" name="source-mode" className="mt-0.5 h-4 w-4 accent-emerald-600" checked={checked} onChange={onChange} disabled={disabled} />
+      <span>
+        <span className="font-medium">{label}</span>
+        <span className="block text-xs text-slate-500 dark:text-slate-400">{hint}</span>
+      </span>
+    </label>
   );
 }
 
