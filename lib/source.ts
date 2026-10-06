@@ -1,92 +1,121 @@
 /**
- * 원본(source) Supabase 접근 — 브라우저에서 anon 키로 실행됩니다.
+ * 원본(source) 읽기 — 브라우저용 SourceReader.
+ *
+ * - anon 모드: 브라우저가 anon 키로 PostgREST를 직접 호출 (RLS 적용)
+ * - service_role 모드: /api/source/* 서버 라우트를 호출. 키는 서버(env 또는 httpOnly 쿠키)에만 있고,
+ *   브라우저는 키를 보거나 보내지 않습니다.
+ *
+ * 두 경로 모두 lib/source-core.ts의 같은 select/order/페이지 쿼리 빌더를 씁니다.
  */
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { buildSelectList, parseOpenApi, type ParseResult, type TableDef } from "./ddl";
+import type { ParseResult, TableDef } from "./ddl";
+import {
+  PAGE_SIZE,
+  SOURCE_MODE_LABEL,
+  SourceError,
+  canonicalSourceUrl,
+  fetchCount,
+  fetchOpenApi,
+  fetchPage,
+  normalizeUrl,
+  type RestConn,
+  type SourceMode,
+} from "./source-core";
 
-export const PAGE_SIZE = 1000;
+export { PAGE_SIZE, SOURCE_MODE_LABEL, SourceError, normalizeUrl };
+export type { SourceMode };
 
-export interface SourceConfig {
-  url: string;
-  anonKey: string;
+export interface SourceReader {
+  readonly mode: SourceMode;
+  /** 정규화된 원본 URL (표시용) */
+  readonly url: string;
+  introspect(): Promise<ParseResult>;
+  count(table: string): Promise<number | null>;
+  fetchPage(table: TableDef, from: number, size?: number): Promise<Record<string, unknown>[]>;
 }
 
-export function normalizeUrl(url: string): string {
-  return url.trim().replace(/\/+$/, "");
+export function createAnonReader(url: string, anonKey: string): SourceReader {
+  const canonical = canonicalSourceUrl(url);
+  if (!canonical) throw new SourceError("원본 URL이 올바르지 않습니다 (http(s)://... 형식, 쿼리/해시 없이).", 400);
+  const conn: RestConn = { url: canonical, key: anonKey.trim() };
+  return {
+    mode: "anon",
+    url: canonical,
+    introspect: () => fetchOpenApi(conn),
+    count: (table) => fetchCount(conn, table),
+    fetchPage: (table, from, size = PAGE_SIZE) => fetchPage(conn, table, from, size),
+  };
 }
 
-function authHeaders(key: string): Record<string, string> {
-  const h: Record<string, string> = { apikey: key };
-  // 새로운 sb_publishable_/sb_secret_ 키는 JWT가 아니므로 apikey 헤더만 보냅니다.
-  if (key.startsWith("eyJ")) h.Authorization = `Bearer ${key}`;
-  return h;
-}
-
-export class SourceError extends Error {}
-
-/** PostgREST OpenAPI로 스키마를 조회합니다. */
-export async function introspect(cfg: SourceConfig): Promise<ParseResult> {
-  const url = normalizeUrl(cfg.url);
+async function apiGet<T>(path: string, params: Record<string, string>): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(`${url}/rest/v1/`, {
-      headers: { ...authHeaders(cfg.anonKey), Accept: "application/openapi+json, application/json" },
-    });
+    res = await fetch(`${path}?${new URLSearchParams(params)}`, { cache: "no-store", credentials: "same-origin" });
   } catch (e) {
-    throw new SourceError(`원본 프로젝트에 연결할 수 없습니다 (URL/네트워크/CORS 확인): ${(e as Error).message}`);
+    throw new SourceError(`서버에 연결할 수 없습니다: ${(e as Error).message}`, 502);
   }
   const text = await res.text();
-  if (!res.ok) {
-    let detail = text.slice(0, 500);
-    try {
-      const j = JSON.parse(text);
-      detail = j.message ?? j.msg ?? j.hint ?? detail;
-    } catch {
-      /* ignore */
-    }
-    if (res.status === 401 || res.status === 403) {
-      throw new SourceError(
-        `OpenAPI 스키마 조회가 거부되었습니다 (HTTP ${res.status}: ${detail}). ` +
-          "프로젝트 설정에서 anon 키로 스키마 조회가 차단되어 있을 수 있습니다. " +
-          "API 키가 올바른지 확인하거나, 스키마 조회가 허용된 키를 입력하세요.",
-      );
-    }
-    throw new SourceError(`OpenAPI 스키마 조회 실패 (HTTP ${res.status}): ${detail}`);
-  }
-  let spec: unknown;
+  let body: unknown = null;
   try {
-    spec = JSON.parse(text);
+    body = text ? JSON.parse(text) : null;
   } catch {
-    throw new SourceError("OpenAPI 응답을 JSON으로 해석할 수 없습니다.");
+    /* ignore */
   }
-  return parseOpenApi(spec);
-}
-
-const clients = new Map<string, SupabaseClient>();
-
-export function getSourceClient(cfg: SourceConfig): SupabaseClient {
-  const key = `${normalizeUrl(cfg.url)}|${cfg.anonKey}`;
-  let c = clients.get(key);
-  if (!c) {
-    c = createClient(normalizeUrl(cfg.url), cfg.anonKey, {
-      auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false, storageKey: `copier-${clients.size}` },
-    });
-    clients.set(key, c);
+  if (!res.ok) {
+    const msg = body && typeof body === "object" && "error" in body ? String((body as { error: unknown }).error) : `HTTP ${res.status}`;
+    throw new SourceError(msg, res.status);
   }
-  return c;
+  return body as T;
 }
 
-export async function countRows(cfg: SourceConfig, table: string): Promise<number | null> {
-  const { count, error } = await getSourceClient(cfg).from(table).select("*", { count: "exact", head: true });
-  if (error) throw new SourceError(`${table} 행 수 조회 실패: ${error.message}`);
-  return count;
+/**
+ * 서버 프록시 리더. `url`은 화면에 표시된 원본 URL로, 서버가 저장된(env/쿠키) URL과 일치하는지
+ * 확인하는 데만 쓰입니다. 서버는 이 값을 요청 대상 결정에 쓰지 않습니다.
+ */
+export function createServerReader(mode: "service-env" | "service-cookie", url: string): SourceReader {
+  const canonical = canonicalSourceUrl(url);
+  if (!canonical) throw new SourceError("원본 URL이 올바르지 않습니다.", 400);
+  const m = mode === "service-env" ? "env" : "cookie";
+  return {
+    mode,
+    url: canonical,
+    introspect: () => apiGet<ParseResult>("/api/source/openapi", { mode: m, url: canonical }),
+    count: async (table) => (await apiGet<{ count: number | null }>("/api/source/count", { mode: m, url: canonical, table })).count,
+    fetchPage: (table, from, size = PAGE_SIZE) =>
+      apiGet<Record<string, unknown>[]>("/api/source/rows", { mode: m, url: canonical, table: table.name, from: String(from), size: String(size) }),
+  };
 }
 
-/** 한 페이지(최대 PAGE_SIZE행)를 읽습니다. PK가 있으면 PK 순으로 정렬합니다. */
-export async function fetchPage(cfg: SourceConfig, table: TableDef, from: number, size = PAGE_SIZE): Promise<Record<string, unknown>[]> {
-  let q = getSourceClient(cfg).from(table.name).select(buildSelectList(table));
-  for (const pk of table.primaryKey) q = q.order(pk, { ascending: true });
-  const { data, error } = await q.range(from, from + size - 1);
-  if (error) throw new SourceError(`${table.name} 읽기 실패 (offset ${from}): ${error.message}`);
-  return (data ?? []) as unknown as Record<string, unknown>[];
+export function describeReader(r: SourceReader): string {
+  return `${SOURCE_MODE_LABEL[r.mode]} · ${r.url}`;
+}
+
+// ---------------------------------------------------------------------------
+// 서버 상태 / 키 저장
+// ---------------------------------------------------------------------------
+
+export interface SourceStatus {
+  env: { available: boolean; reason?: string; url: string | null; ref: string | null; gate?: "project-access" | "unverified"; keyKind?: string };
+  /** env 모드 접근 권한 (gate가 project-access일 때) */
+  envAccess: { state: "ok" | "login-required" | "denied" | "error" | "not-applicable"; message?: string };
+  cookie: { present: boolean; url: string | null; keyKind?: string };
+  loggedIn: boolean;
+}
+
+export async function fetchSourceStatus(): Promise<SourceStatus> {
+  return apiGet<SourceStatus>("/api/source/status", {});
+}
+
+export async function saveServiceKey(url: string, key: string): Promise<{ url: string; keyKind: string; warning?: string }> {
+  const res = await fetch("/api/source/key", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, key }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new SourceError(body.error ?? `HTTP ${res.status}`, res.status);
+  return body;
+}
+
+export async function forgetServiceKey(): Promise<void> {
+  await fetch("/api/source/forget", { method: "POST" });
 }

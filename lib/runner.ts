@@ -1,5 +1,6 @@
 /**
- * 마이그레이션 실행기 (브라우저). 원본에서 행을 읽어 /api/target/query 로 대상에 씁니다.
+ * 마이그레이션 실행기 (브라우저). 원본에서 SourceReader로 행을 읽어 /api/target/query 로 대상에 씁니다.
+ * (anon 모드는 브라우저가 직접, service_role 모드는 /api/source/* 서버 라우트를 통해 읽음)
  */
 import {
   buildInsertSql,
@@ -9,7 +10,7 @@ import {
   type PlanStep,
   type TableDef,
 } from "./ddl";
-import { fetchPage, type SourceConfig } from "./source";
+import { describeReader, type SourceReader } from "./source";
 
 export type TableStatus = "pending" | "running" | "done" | "failed" | "skipped";
 
@@ -29,7 +30,7 @@ export interface RunCallbacks {
 }
 
 export interface RunInput {
-  source: SourceConfig;
+  source: SourceReader;
   ref: string;
   tables: TableDef[];
   selected: string[];
@@ -145,6 +146,9 @@ export async function runMigration(input: RunInput, cb: RunCallbacks): Promise<R
 
   try {
     cb.log("info", `시작: ${plan.order.length}개 테이블 → 프로젝트 ${ref}`);
+    cb.log(input.source.mode === "anon" ? "info" : "warn", `원본 읽기 모드: ${describeReader(input.source)}`);
+    if (input.source.mode === "anon") cb.log("info", "anon 모드: RLS 정책이 허용하는 행만 복사됩니다.");
+    else cb.log("warn", "service_role 모드: RLS를 우회하여 모든 행을 서버에서 읽습니다.");
     for (const step of plan.pre) await runStep(step);
 
     for (const name of plan.order) {
@@ -164,7 +168,7 @@ export async function runMigration(input: RunInput, cb: RunCallbacks): Promise<R
       try {
         for (;;) {
           checkStop();
-          const rows = await fetchPage(input.source, table, offset);
+          const rows = await input.source.fetchPage(table, offset);
           if (rows.length === 0) break;
           offset += rows.length;
           for (const batch of chunkRows(rows)) {
